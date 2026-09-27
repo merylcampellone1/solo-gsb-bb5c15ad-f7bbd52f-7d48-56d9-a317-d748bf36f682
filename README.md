@@ -18,6 +18,10 @@ API，遵循 [RFC 9110 §14](https://www.rfc-editor.org/rfc/rfc9110.html#section
 区间，校验片段一致性与覆盖完整性后，**只从缓存字节**拼出源站应有的原始
 响应体（单段或 `multipart/byteranges`），连同状态码与响应头一并返回。
 
+`POST /cache-retention-plan` 用于缓存淘汰决策：上报已缓存区间与带正整数
+权重的预计访问区间，服务在 `budgetBytes` 预算内按“每字节累计权重降序、
+偏移升序”算出应当保留的缓存字节（见下文）。
+
 ## 单条启动命令
 
 ```bash
@@ -369,6 +373,66 @@ curl -X POST http://localhost:3000/assemble-response \
 `--boundary--` CRLF），段顺序与规划顺序一致（保持各区间首次出现的顺序，
 不一定是偏移升序）。
 
+### `POST /cache-retention-plan`（缓存保留规划）
+
+面向缓存淘汰场景：客户端上报**已缓存**的字节区间与**预计访问**的加权区间，
+服务在 `budgetBytes` 预算内算出应当保留哪些缓存字节。重叠缓存只计一次；
+重叠访问的权重按字节累加；只有“已缓存且有正价值（被至少一条访问区间
+覆盖）”的字节参与保留。选择按**每字节累计权重降序、偏移升序**进行，
+允许在区间内部截断（截断时保留该段内偏移最低的字节），选中的字节再合并
+相邻区间后返回。全部参数在 JSON 体内，不涉及 `Range` 请求头。
+
+请求体：
+
+| 字段          | 类型    | 必填 | 说明                                                         |
+| ------------- | ------- | ---- | ------------------------------------------------------------ |
+| `size`        | integer | 是   | 资源总字节数，非负安全整数（≥ 0）                             |
+| `cached`      | array   | 是   | 已缓存区间数组（≤ 1000 项），每项 `{"start":…,"end":…}` 为**闭区间**（起止端点均含）；可乱序、重叠或相邻 |
+| `accesses`    | array   | 是   | 预计访问区间数组（≤ 1000 项），每项 `{"start":…,"end":…,"weight":…}` 为**闭区间**加正整数权重（1～1000000） |
+| `budgetBytes` | integer | 是   | 保留预算字节数，非负安全整数（≥ 0）                           |
+
+校验与 `/resume-plan` 同样严格（严格校验器，不做类型强转与属性剔除）：所有
+数值必须是安全整数；区间需满足 `0 ≤ start ≤ end < size`；`cached` 与
+`accesses` 各最多 1000 项；权重不超过 1000000；不允许多余字段。
+
+响应（`200`）字段：
+
+| 字段            | 说明                                                         |
+| --------------- | ------------------------------------------------------------ |
+| `retained`      | 应当保留的闭区间数组，按起点升序，相邻区间已合并              |
+| `retainedBytes` | 实际保留的字节数（≤ `budgetBytes`）                           |
+| `unusedBytes`   | 未用掉的预算（`budgetBytes − retainedBytes`）；缓存中正价值字节不足预算时大于 0 |
+
+示例：缓存 `[0,999]` 与 `[2000,2999]`，访问 `[100,199]` 权重 5、`[150,249]`
+权重 3、`[2100,2199]` 权重 10——累计权重为 `[100,149]`=5、`[150,199]`=8、
+`[200,249]`=3、`[2100,2199]`=10。预算 150 字节时先取权重 10 的
+`[2100,2199]`（100 字节），再取权重 8 的 `[150,199]`（50 字节），预算恰好
+用完：
+
+```bash
+curl -X POST http://localhost:3000/cache-retention-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"size":10000,"cached":[{"start":0,"end":999},{"start":2000,"end":2999}],"accesses":[{"start":100,"end":199,"weight":5},{"start":150,"end":249,"weight":3},{"start":2100,"end":2199,"weight":10}],"budgetBytes":150}'
+```
+
+响应：
+
+```json
+{
+  "statusCode": 200,
+  "retained": [
+    { "start": 150, "end": 199 },
+    { "start": 2100, "end": 2199 }
+  ],
+  "retainedBytes": 150,
+  "unusedBytes": 0
+}
+```
+
+把上例的 `budgetBytes` 改成 `180`，会再从权重 5 的 `[100,149]` 中截断保留
+偏移最低的 30 字节，`retained` 变为 `[100,129]`、`[150,199]`、
+`[2100,2199]`，`retainedBytes` 为 180。
+
 ## 响应语义
 
 每个规划结果带 `decision` 字段：
@@ -491,7 +555,8 @@ src/
   resume.js         # 断点续传缺口规划：区间归并、缺口计算、按 chunkBytes/limit 拆分
   multipart-check.js # multipart/byteranges 报文核验：boundary 解析、严格分段、Content-Range 核算、区间归并/差集
   assemble.js       # 稀疏缓存拼装：片段校验、重叠冲突检测、覆盖核算、单段/multipart 报文生成
-  app.js            # Fastify 应用：POST/GET /plan、POST /resume-plan、POST /multipart-check、POST /assemble-response、/healthz、输入校验
+  cache-retention.js # 缓存保留规划：权重扫描线、缓存交集、按权重/偏移选满预算、相邻合并
+  app.js            # Fastify 应用：POST/GET /plan、POST /resume-plan、POST /multipart-check、POST /assemble-response、POST /cache-retention-plan、/healthz、输入校验
   server.js         # 启动入口与环境变量读取
 test/
   planner.test.js       # 原有 node:test 用例（26 个）
@@ -500,13 +565,14 @@ test/
   resume.test.js        # 断点续传缺口规划用例（24 个）
   multipart-check.test.js # multipart/byteranges 核验用例（32 个）
   assemble.test.js      # 稀疏缓存拼装用例（31 个）
+  cache-retention.test.js # 缓存保留规划用例（30 个）
 ```
 
 ## 本地开发与测试
 
 ```bash
 npm ci
-npm test          # 151 个用例：区间解析/合并/416/422/边界 + If-Range ETag/三种 HTTP-date/降级 + 重复头/CRLF + 续传缺口规划 + multipart 核验 + 稀疏缓存拼装
+npm test          # 181 个用例：区间解析/合并/416/422/边界 + If-Range ETag/三种 HTTP-date/降级 + 重复头/CRLF + 续传缺口规划 + multipart 核验 + 稀疏缓存拼装 + 缓存保留规划
 npm start
 ```
 
@@ -540,3 +606,8 @@ npm start
   重叠片段字节不一致（`409 FRAGMENT_CONFLICT`）或覆盖不完整
   （`409 INCOMPLETE_COVERAGE`）时不会生成任何响应体；`contentType` 沿用
   `/plan` 的媒体类型与 CR/LF 检查，杜绝响应头注入。
+- `/cache-retention-plan` 同样使用严格校验器：所有数值必须是非负安全整数，
+  `cached` 与 `accesses` 各上限 1000 项，访问权重为 1～1000000 的整数，
+  多余字段一律 `400`；两类区间都必须满足 `0 ≤ start ≤ end < size`
+  （越界分别返回 `CACHED_RANGE_OUT_OF_BOUNDS` / `ACCESS_RANGE_OUT_OF_BOUNDS`），
+  防止超大输入耗尽资源。

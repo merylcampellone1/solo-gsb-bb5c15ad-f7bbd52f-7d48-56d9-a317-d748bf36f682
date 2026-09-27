@@ -21,6 +21,12 @@ import {
   MAX_FRAGMENTS,
   MAX_FRAGMENT_BASE64_LENGTH,
 } from './assemble.js';
+import {
+  planCacheRetention,
+  MAX_CACHED_INTERVALS,
+  MAX_ACCESS_INTERVALS,
+  MAX_ACCESS_WEIGHT,
+} from './cache-retention.js';
 import { ENTITY_TAG_RE, parseHttpDate } from './conditional.js';
 
 const MEDIA_TYPE_RE =
@@ -112,6 +118,47 @@ const assembleBodySchema = {
       maxItems: MAX_FRAGMENTS,
       items: fragmentSchema,
     },
+  },
+};
+
+const cachedIntervalSchema = {
+  type: 'object',
+  required: ['start', 'end'],
+  additionalProperties: false,
+  properties: {
+    start: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+    end: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+  },
+};
+
+const accessIntervalSchema = {
+  type: 'object',
+  required: ['start', 'end', 'weight'],
+  additionalProperties: false,
+  properties: {
+    start: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+    end: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+    weight: { type: 'integer', minimum: 1, maximum: MAX_ACCESS_WEIGHT },
+  },
+};
+
+const cacheRetentionBodySchema = {
+  type: 'object',
+  required: ['size', 'cached', 'accesses', 'budgetBytes'],
+  additionalProperties: false,
+  properties: {
+    size: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+    cached: {
+      type: 'array',
+      maxItems: MAX_CACHED_INTERVALS,
+      items: cachedIntervalSchema,
+    },
+    accesses: {
+      type: 'array',
+      maxItems: MAX_ACCESS_INTERVALS,
+      items: accessIntervalSchema,
+    },
+    budgetBytes: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
   },
 };
 
@@ -248,6 +295,21 @@ export function buildApp(config = {}) {
         transferSizeRatio,
       });
 
+      return reply.status(result.statusCode).send(result);
+    },
+  );
+
+  // Cache retention planning under a byte budget: POST /cache-retention-plan
+  // with the cache, the weighted access prediction and the budget all in the
+  // JSON body; no Range header involved.
+  app.post(
+    '/cache-retention-plan',
+    {
+      schema: { body: cacheRetentionBodySchema },
+      validatorCompiler: strictBodyValidatorCompiler,
+    },
+    async (request, reply) => {
+      const result = planCacheRetention(request.body);
       return reply.status(result.statusCode).send(result);
     },
   );
